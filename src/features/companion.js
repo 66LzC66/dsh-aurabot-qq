@@ -162,10 +162,20 @@ export function createMood({ getConfig, dsh, log }) {
 
 // ---------------- 主动搭话 ----------------
 
-export function createSpeakUp({ getConfig, hub, log, isMuted, memory }) {
+export function createSpeakUp({ getConfig, hub, log, isMuted, memory, asleep }) {
   const file = () => dataDir('speakup.json')
   const load = () => readJson(file(), () => ({ day: '', count: 0, nextAt: 0, last: 0 }))
   const save = (s) => writeJson(file(), s)
+
+  // 她睡着了就别主动找人：睡觉是由别的模块（比如长夜如梦）管的，这里只能问它。
+  // 拿不到就说没睡（模块没装、被关了、还在加载），免得把主动搭话整个废掉。
+  function isAsleep() {
+    try {
+      return Boolean(asleep?.())
+    } catch {
+      return false
+    }
+  }
 
   function schedule(s, cfg) {
     const min = cfg.minIntervalMinutes
@@ -211,8 +221,7 @@ export function createSpeakUp({ getConfig, hub, log, isMuted, memory }) {
   /** 白名单：每人单独算次数和间隔，一分钟最多找一个人，不一口气群发。 */
   async function tickFriends(cfg, s) {
     const c = cfg.speakUp
-    const h = new Date().getHours()
-    if (!(h >= c.awakeFrom && h < c.awakeTo)) return false
+    if (isAsleep()) return false // 睡着时连白名单也不找，醒来再说
     const today = new Date().toDateString()
     s.friends = s.friends || {}
     for (const qq of c.allow || []) {
@@ -236,6 +245,11 @@ export function createSpeakUp({ getConfig, hub, log, isMuted, memory }) {
     const c = cfg.speakUp
     if (!cfg.enabled || !c.enabled) return
     if (cfg.ext?.purpose?.enabled === true) return // 目的引擎开着时由它主动找人，两套都跑同一个人会被找两次
+    const h = new Date().getHours()
+    const awake = h >= c.awakeFrom && h < c.awakeTo
+    // 不该说话的时候什么都不做：不动状态、不排下次时间，免得跨天清零在睡着时被提前执行
+    if (!awake) return
+    if (isAsleep()) return // 她说晚安睡了就别再发「在吗」
     if (isMuted?.(`private:${cfg.ownerQQ}`)) { // 主人在私聊里让她闭嘴了：只管主人这边，白名单照旧
       const s = load()
       if (!(await tickFriends(cfg, s))) save(s)
@@ -245,19 +259,17 @@ export function createSpeakUp({ getConfig, hub, log, isMuted, memory }) {
     const today = new Date().toDateString()
     if (s.day !== today) Object.assign(s, { day: today, count: 0 })
     if (!s.nextAt) schedule(s, c)
-    const h = new Date().getHours()
-    const awake = h >= c.awakeFrom && h < c.awakeTo
     const idleOk = Date.now() - lastPrivateAt() > c.idleMinutes * 60_000
     // 追问：她最后一句是在问主人、主人 15~40 分钟没回，有一半的机会轻轻追一句（每句最多追一次，不占每天的次数）
     const lb = hub.lastBotToOwner || { at: 0, text: '' }
     const quiet = Date.now() - lb.at
-    if (awake && c.nudge && lb.at > (hub.lastOwnerChatAt || 0) && lb.at !== s.nudgedFor && /[？?]|吗|呢|嘛|没$/.test(lb.text.trim()) && quiet > 15 * 60_000 && quiet < 40 * 60_000) {
+    if (c.nudge && lb.at > (hub.lastOwnerChatAt || 0) && lb.at !== s.nudgedFor && /[？?]|吗|呢|嘛|没$/.test(lb.text.trim()) && quiet > 15 * 60_000 && quiet < 40 * 60_000) {
       s.nudgedFor = lb.at
       save(s)
       if (Math.random() < 0.5) await fire('追问', { nudge: true })
       return
     }
-    if (awake && idleOk && s.count < c.maxPerDay && Date.now() >= s.nextAt) {
+    if (idleOk && s.count < c.maxPerDay && Date.now() >= s.nextAt) {
       s.count++
       s.last = Date.now()
       schedule(s, c)
